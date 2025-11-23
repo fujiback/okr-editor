@@ -1,0 +1,808 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>OKR Canvas - Layered View</title>
+    
+    <!-- React & Libraries -->
+    <script src="https://unpkg.com/react@18/umd/react.development.js"></script>
+    <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js"></script>
+    <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    
+    <!-- Icons (Lucide) -->
+    <script src="https://unpkg.com/lucide@latest"></script>
+
+    <style>
+        body, html { height: 100%; margin: 0; font-family: 'Inter', sans-serif; background-color: #111827; color: #e0e0e0; overflow: hidden; }
+        textarea::-webkit-scrollbar { width: 8px; }
+        textarea::-webkit-scrollbar-track { background: #1f2937; }
+        textarea::-webkit-scrollbar-thumb { background: #4b5563; border-radius: 4px; }
+        .canvas-container { cursor: grab; }
+        .canvas-container:active { cursor: grabbing; }
+    </style>
+</head>
+<body>
+    <div id="root" class="h-full w-full"></div>
+
+    <script type="text/babel">
+        const { useState, useEffect, useRef, useMemo, useCallback } = React;
+
+        const CONSTANTS = {
+            NODE_WIDTH: 320,
+            HEADER_HEIGHT: 44,
+            ROW_HEIGHT: 36,
+            LAYER_HEIGHT: 400,
+            LAYER_LABEL_HEIGHT: 40,
+            PADDING: 16,
+            FONT_SIZE_TITLE: 15,
+            FONT_SIZE_BODY: 13,
+            COLORS: {
+                OBJ_BG: '#172554', 
+                OBJ_BORDER: '#3b82f6', 
+                BODY_BG: '#1f2937', 
+                BODY_BORDER: '#374151', 
+                TEXT_TITLE: '#ffffff',
+                TEXT_BODY: '#e5e7eb',
+                TEXT_MUTED: '#9ca3af',
+                ALIGN_LINE: '#60a5fa', 
+                CHECKBOX_OFF: '#4b5563',
+                CHECKBOX_ON: '#10b981',
+                LAYER_BG: 'rgba(255, 255, 255, 0.03)',
+                LAYER_TEXT: 'rgba(255, 255, 255, 0.3)'
+            }
+        };
+
+        const DEFAULT_TEXT = `# Company Layer (全社目標)
+## O_Comp: Make the World Better
+- [ ] KR_C1: 10M Users
+- [ ] KR_C2: $100M Revenue
+
+# Product Team Layer (チーム目標)
+## O_Prod: Best UX in the Market
+> Alignment: KR_C1
+- [ ] KR_P1: Release v2.0
+- [ ] KR_P2: NPS > 50
+
+# Personal Layer (個人目標)
+## O_Me: Lead Frontend Architecture
+> Alignment: KR_P1
+- [x] KR_Me1: Refactor to React
+- [ ] KR_Me2: Write Documentation`;
+
+        const STORAGE_KEY_PREFIX = "okr_canvas_v3_";
+
+        // --- Robust Helper for Rounded Rects ---
+        function drawRoundedRect(ctx, x, y, width, height, radius) {
+            ctx.beginPath();
+            let r = radius;
+            if (typeof r === 'number') r = [r, r, r, r];
+            
+            const [tl, tr, br, bl] = r;
+
+            ctx.moveTo(x + tl, y);
+            ctx.lineTo(x + width - tr, y);
+            ctx.quadraticCurveTo(x + width, y, x + width, y + tr);
+            ctx.lineTo(x + width, y + height - br);
+            ctx.quadraticCurveTo(x + width, y + height, x + width - br, y + height);
+            ctx.lineTo(x + bl, y + height);
+            ctx.quadraticCurveTo(x, y + height, x, y + height - bl);
+            ctx.lineTo(x, y + tl);
+            ctx.quadraticCurveTo(x, y, x + tl, y);
+            ctx.closePath();
+        }
+
+        // --- URL Encoding Helpers ---
+        const encodeState = (text, layout) => {
+            try {
+                const state = JSON.stringify({ t: text, l: layout });
+                return btoa(encodeURIComponent(state));
+            } catch (e) { console.error("Encoding failed", e); return ""; }
+        };
+
+        const decodeState = (encoded) => {
+            try {
+                const json = decodeURIComponent(atob(encoded));
+                return JSON.parse(json);
+            } catch (e) { console.error("Decoding failed", e); return null; }
+        };
+
+        function App() {
+            const [worlds, setWorlds] = useState(["Default"]);
+            const [currentWorld, setCurrentWorld] = useState("Default");
+            const [text, setText] = useState(DEFAULT_TEXT);
+            const [layoutMap, setLayoutMap] = useState({}); 
+            const [showEditor, setShowEditor] = useState(true);
+            const [transform, setTransform] = useState({ x: 0, y: 0, k: 1 });
+            
+            // UI State
+            const [lastSaved, setLastSaved] = useState(null);
+            const [urlCopied, setUrlCopied] = useState(false);
+            
+            // World Creation State
+            const [isCreatingWorld, setIsCreatingWorld] = useState(false);
+            const [newWorldName, setNewWorldName] = useState("");
+
+            const fileInputRef = useRef(null);
+            const canvasRef = useRef(null);
+            const containerRef = useRef(null);
+            const isDraggingRef = useRef(false);
+            const dragTargetRef = useRef(null);
+            const lastPosRef = useRef({ x: 0, y: 0 });
+
+            // --- Persistence Logic ---
+            useEffect(() => {
+                // 1. Check URL Parameters first
+                const params = new URLSearchParams(window.location.search);
+                const dataParam = params.get('data');
+                
+                if (dataParam) {
+                    const decoded = decodeState(dataParam);
+                    if (decoded) {
+                        setText(decoded.t || DEFAULT_TEXT);
+                        setLayoutMap(decoded.l || {});
+                        setCurrentWorld("URL_Imported");
+                        return;
+                    }
+                }
+
+                // 2. Fallback to LocalStorage (Might fail in sandbox)
+                try {
+                    const storedWorlds = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "worlds") || '["Default"]');
+                    setWorlds(storedWorlds);
+                    loadWorld("Default");
+                } catch(e) { 
+                    console.warn("LocalStorage access failed or empty:", e); 
+                    // Fallback to default in memory
+                }
+            }, []);
+
+            const loadWorld = (worldName) => {
+                try {
+                    const data = localStorage.getItem(STORAGE_KEY_PREFIX + "data_" + worldName);
+                    const layout = localStorage.getItem(STORAGE_KEY_PREFIX + "layout_" + worldName);
+                    setText(data ? data : DEFAULT_TEXT);
+                    setLayoutMap(layout ? JSON.parse(layout) : {});
+                    setCurrentWorld(worldName);
+                } catch (e) { console.warn("Load failed", e); }
+            };
+
+            const saveWorld = (worldName, newText, newLayout) => {
+                // Save to LocalStorage (Best effort)
+                try {
+                    localStorage.setItem(STORAGE_KEY_PREFIX + "data_" + worldName, newText);
+                    if (newLayout) localStorage.setItem(STORAGE_KEY_PREFIX + "layout_" + worldName, JSON.stringify(newLayout));
+                    
+                    const now = new Date();
+                    setLastSaved(now.toLocaleTimeString());
+                } catch (e) { console.warn("Save failed (likely sandbox)", e); }
+                
+                setUrlCopied(false);
+            };
+
+            // --- World Management ---
+            const startCreateWorld = () => {
+                setIsCreatingWorld(true);
+                setNewWorldName("");
+            };
+
+            const cancelCreateWorld = () => {
+                setIsCreatingWorld(false);
+                setNewWorldName("");
+            };
+
+            const confirmCreateWorld = () => {
+                const name = newWorldName.trim();
+                if (name && !worlds.includes(name)) {
+                    const newWorlds = [...worlds, name];
+                    setWorlds(newWorlds);
+                    try {
+                        localStorage.setItem(STORAGE_KEY_PREFIX + "worlds", JSON.stringify(newWorlds));
+                    } catch(e){}
+                    
+                    // Switch to new world
+                    setText(DEFAULT_TEXT);
+                    setLayoutMap({});
+                    setCurrentWorld(name);
+                    saveWorld(name, DEFAULT_TEXT, {});
+                    
+                    setIsCreatingWorld(false);
+                } else if (worlds.includes(name)) {
+                    alert("That name already exists!");
+                }
+            };
+
+            const handleShareUrl = () => {
+                const encoded = encodeState(text, layoutMap);
+                const url = `${window.location.origin}${window.location.pathname}?data=${encoded}`;
+                
+                // Try to update URL bar (Works on GitHub Pages, Fails gracefully in Sandbox)
+                try {
+                    window.history.pushState({}, '', `?data=${encoded}`);
+                } catch (e) {
+                    // Sandbox blocked it, ignore
+                    console.log("URL update skipped (Sandbox)");
+                }
+                
+                navigator.clipboard.writeText(url).then(() => {
+                    setUrlCopied(true);
+                    setTimeout(() => setUrlCopied(false), 3000);
+                }).catch(err => alert("Failed to copy URL. Browser restrictions may apply."));
+            };
+
+            // --- File & Image Export/Import ---
+            const handleExportJson = () => {
+                const data = {
+                    worldName: currentWorld,
+                    text: text,
+                    layout: layoutMap,
+                    timestamp: new Date().toISOString()
+                };
+                const blob = new Blob([JSON.stringify(data, null, 2)], { type: "application/json" });
+                const url = URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = url;
+                a.download = `okr-canvas-${currentWorld}-${new Date().toISOString().slice(0,10)}.json`;
+                document.body.appendChild(a);
+                a.click();
+                document.body.removeChild(a);
+                URL.revokeObjectURL(url);
+            };
+
+            const handleExportPng = () => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                
+                try {
+                    const dataUrl = canvas.toDataURL('image/png');
+                    const a = document.createElement('a');
+                    a.href = dataUrl;
+                    a.download = `okr-canvas-${currentWorld}-${new Date().toISOString().slice(0,10)}.png`;
+                    document.body.appendChild(a);
+                    a.click();
+                    document.body.removeChild(a);
+                } catch (e) {
+                    console.error("PNG export failed", e);
+                    alert("Failed to export PNG. (Canvas might be tainted or secure context issue)");
+                }
+            };
+
+            const handleImportClick = () => {
+                fileInputRef.current?.click();
+            };
+
+            const handleFileChange = (e) => {
+                const file = e.target.files[0];
+                if (!file) return;
+
+                const reader = new FileReader();
+                reader.onload = (event) => {
+                    try {
+                        const json = JSON.parse(event.target.result);
+                        if (json.text) {
+                            const targetName = json.worldName || currentWorld;
+                            
+                            if (!worlds.includes(targetName)) {
+                                const newWorlds = [...worlds, targetName];
+                                setWorlds(newWorlds);
+                                try { localStorage.setItem(STORAGE_KEY_PREFIX + "worlds", JSON.stringify(newWorlds)); } catch(e){}
+                            }
+
+                            setText(json.text);
+                            setLayoutMap(json.layout || {});
+                            setCurrentWorld(targetName);
+                            saveWorld(targetName, json.text, json.layout || {});
+                            alert("Loaded successfully!");
+                        } else {
+                            alert("Invalid JSON format");
+                        }
+                    } catch (err) {
+                        alert("Failed to parse JSON");
+                    }
+                };
+                reader.readAsText(file);
+                e.target.value = '';
+            };
+
+
+            // --- Parsing ---
+            const parsedGraph = useMemo(() => {
+                const lines = text.split('\n');
+                const layers = [];
+                const nodes = [];
+                const edges = [];
+                const idToNodeMap = {};
+
+                let currentLayer = null;
+                let currentObjNode = null;
+                let currentRowIndex = 0;
+                let layerCounter = 0;
+
+                lines.forEach((line, idx) => {
+                    const trimmed = line.trim();
+                    if (!trimmed) return;
+
+                    if (line.startsWith('# ') && !line.startsWith('## ')) {
+                        const layerName = line.replace('# ', '').trim();
+                        currentLayer = { name: layerName, index: layerCounter++ };
+                        layers.push(currentLayer);
+                    }
+                    else if (line.startsWith('## ')) {
+                        if (!currentLayer) {
+                            currentLayer = { name: "Default Layer", index: 0 };
+                            layers.push(currentLayer);
+                            layerCounter = 1;
+                        }
+                        const content = line.replace('## ', '').trim();
+                        const idMatch = content.match(/^([^:]+):/);
+                        const displayId = idMatch ? idMatch[1] : null;
+                        const label = idMatch ? content.substring(idMatch[0].length).trim() : content;
+                        const nodeId = `obj-${idx}`;
+
+                        currentObjNode = {
+                            id: nodeId,
+                            lineIndex: idx,
+                            layerIndex: currentLayer.index,
+                            displayId,
+                            label,
+                            krs: [],
+                            alignments: [],
+                            width: CONSTANTS.NODE_WIDTH,
+                            height: CONSTANTS.HEADER_HEIGHT
+                        };
+                        nodes.push(currentObjNode);
+                        currentRowIndex = 0;
+                        if (displayId) idToNodeMap[displayId] = { nodeId, type: 'NODE' };
+                    }
+                    else if (trimmed.startsWith('- ')) {
+                        if (!currentObjNode) return;
+                        const isChecked = trimmed.includes('[x]');
+                        const content = trimmed.replace(/- \[[x ]\] /, '').trim();
+                        const idMatch = content.match(/^([^:]+):/);
+                        const displayId = idMatch ? idMatch[1] : null;
+                        const label = idMatch ? content.substring(idMatch[0].length).trim() : content;
+
+                        currentObjNode.krs.push({
+                            lineIndex: idx,
+                            displayId,
+                            label,
+                            checked: isChecked,
+                            rowIndex: currentRowIndex
+                        });
+                        if (displayId) idToNodeMap[displayId] = { nodeId: currentObjNode.id, type: 'ROW', rowIndex: currentRowIndex };
+                        currentObjNode.height += CONSTANTS.ROW_HEIGHT;
+                        currentRowIndex++;
+                    }
+                    else if (trimmed.startsWith('> ')) {
+                        if (!currentObjNode) return;
+                        const targetsStr = trimmed.replace(/^> (Alignment:|Aligns to:|Alignment)\s*/i, '').trim();
+                        const targets = targetsStr.split(',').map(s => s.trim());
+                        currentObjNode.alignments.push(...targets);
+                    }
+                });
+
+                nodes.forEach(node => {
+                    node.alignments.forEach(targetId => {
+                        const target = idToNodeMap[targetId];
+                        if (target) {
+                            edges.push({
+                                source: node.id,
+                                targetNodeId: target.nodeId,
+                                targetType: target.type,
+                                targetRowIndex: target.rowIndex
+                            });
+                        }
+                    });
+                });
+                return { layers, nodes, edges };
+            }, [text]);
+
+            // --- Layout ---
+            const layoutGraph = useCallback((forceAuto = false) => {
+                const { nodes, layers } = parsedGraph;
+                const newLayout = { ...layoutMap };
+                const NODE_SPACING = 340;
+
+                const nodesByLayer = {};
+                nodes.forEach(node => {
+                    if (!nodesByLayer[node.layerIndex]) nodesByLayer[node.layerIndex] = [];
+                    nodesByLayer[node.layerIndex].push(node);
+                });
+
+                layers.forEach(layer => {
+                    const layerNodes = nodesByLayer[layer.index] || [];
+                    const totalWidth = layerNodes.length * NODE_SPACING;
+                    const startX = -(totalWidth / 2) + (NODE_SPACING / 2);
+                    
+                    layerNodes.forEach((node, i) => {
+                        const saved = layoutMap[node.id];
+                        if (forceAuto || !saved) {
+                            const x = startX + (i * NODE_SPACING);
+                            const y = (layer.index * CONSTANTS.LAYER_HEIGHT) + 80;
+                            newLayout[node.id] = { x, y };
+                        }
+                    });
+                });
+                setLayoutMap(newLayout);
+                if (forceAuto) saveWorld(currentWorld, text, newLayout);
+            }, [parsedGraph, layoutMap, currentWorld, text]);
+
+            useEffect(() => { layoutGraph(false); }, [parsedGraph.nodes.length]);
+
+            // --- Draw ---
+            const draw = useCallback(() => {
+                const canvas = canvasRef.current;
+                if (!canvas) return;
+                const ctx = canvas.getContext('2d');
+                const { width, height } = containerRef.current.getBoundingClientRect();
+                const dpr = window.devicePixelRatio || 1;
+                
+                if (canvas.width !== width * dpr || canvas.height !== height * dpr) {
+                    canvas.width = width * dpr;
+                    canvas.height = height * dpr;
+                    canvas.style.width = `${width}px`;
+                    canvas.style.height = `${height}px`;
+                }
+                
+                ctx.save();
+                ctx.scale(dpr, dpr);
+                ctx.fillStyle = '#111827';
+                ctx.fillRect(0, 0, width, height);
+
+                ctx.translate(transform.x, transform.y);
+                ctx.scale(transform.k, transform.k);
+
+                // 0. Draw Layers
+                const visibleMinX = -transform.x / transform.k;
+                const visibleMaxX = (width - transform.x) / transform.k;
+                const bgX = visibleMinX - 1000;
+                const bgW = (visibleMaxX - visibleMinX) + 2000;
+
+                parsedGraph.layers.forEach((layer, i) => {
+                    const y = layer.index * CONSTANTS.LAYER_HEIGHT;
+                    if (i % 2 === 0) {
+                        ctx.fillStyle = 'rgba(255, 255, 255, 0.02)';
+                        ctx.fillRect(bgX, y, bgW, CONSTANTS.LAYER_HEIGHT);
+                    }
+                    ctx.fillStyle = CONSTANTS.COLORS.LAYER_TEXT;
+                    ctx.font = 'bold 24px Inter';
+                    ctx.textBaseline = 'top';
+                    ctx.fillText(layer.name, -400, y + 20);
+                    
+                    ctx.beginPath();
+                    ctx.moveTo(bgX, y + CONSTANTS.LAYER_HEIGHT);
+                    ctx.lineTo(bgX + bgW, y + CONSTANTS.LAYER_HEIGHT);
+                    ctx.strokeStyle = '#374151';
+                    ctx.lineWidth = 1 / transform.k;
+                    ctx.setLineDash([10, 10]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+                });
+
+                // 1. Draw Nodes
+                parsedGraph.nodes.forEach(node => {
+                    const pos = layoutMap[node.id] || { x: 0, y: 0 };
+                    
+                    ctx.shadowColor = 'rgba(0,0,0,0.4)';
+                    ctx.shadowBlur = 20;
+                    ctx.shadowOffsetY = 8;
+
+                    // Header
+                    drawRoundedRect(ctx, pos.x, pos.y, node.width, CONSTANTS.HEADER_HEIGHT, [8, 8, 0, 0]);
+                    ctx.fillStyle = CONSTANTS.COLORS.OBJ_BG;
+                    ctx.fill();
+                    ctx.strokeStyle = CONSTANTS.COLORS.OBJ_BORDER;
+                    ctx.lineWidth = 1;
+                    ctx.stroke();
+
+                    ctx.shadowColor = 'transparent';
+                    ctx.fillStyle = CONSTANTS.COLORS.TEXT_TITLE;
+                    ctx.font = `bold ${CONSTANTS.FONT_SIZE_TITLE}px Inter`;
+                    ctx.textBaseline = 'middle';
+                    const title = (node.displayId ? `${node.displayId}: ` : '') + node.label;
+                    ctx.fillText(title, pos.x + 12, pos.y + CONSTANTS.HEADER_HEIGHT / 2, node.width - 24);
+
+                    // Body
+                    if (node.krs.length > 0) {
+                        const bodyH = node.krs.length * CONSTANTS.ROW_HEIGHT;
+                        drawRoundedRect(ctx, pos.x, pos.y + CONSTANTS.HEADER_HEIGHT, node.width, bodyH, [0, 0, 8, 8]);
+                        ctx.fillStyle = CONSTANTS.COLORS.BODY_BG;
+                        ctx.fill();
+                        ctx.strokeStyle = CONSTANTS.COLORS.BODY_BORDER;
+                        ctx.stroke();
+
+                        node.krs.forEach((kr, i) => {
+                            const rowY = pos.y + CONSTANTS.HEADER_HEIGHT + (i * CONSTANTS.ROW_HEIGHT);
+                            const centerY = rowY + CONSTANTS.ROW_HEIGHT / 2;
+                            
+                            if (i > 0) {
+                                ctx.beginPath();
+                                ctx.moveTo(pos.x, rowY);
+                                ctx.lineTo(pos.x + node.width, rowY);
+                                ctx.strokeStyle = '#374151';
+                                ctx.lineWidth = 0.5;
+                                ctx.stroke();
+                            }
+
+                            const ckSize = 14;
+                            const ckX = pos.x + 12;
+                            const ckY = centerY - ckSize / 2;
+                            
+                            ctx.fillStyle = kr.checked ? CONSTANTS.COLORS.CHECKBOX_ON : 'transparent';
+                            ctx.strokeStyle = kr.checked ? CONSTANTS.COLORS.CHECKBOX_ON : CONSTANTS.COLORS.CHECKBOX_OFF;
+                            drawRoundedRect(ctx, ckX, ckY, ckSize, ckSize, 3);
+                            ctx.fill();
+                            ctx.stroke();
+                            if (kr.checked) {
+                                ctx.fillStyle = '#fff';
+                                ctx.font = '10px Arial';
+                                ctx.fillText('✓', ckX + 2.5, centerY + 1);
+                            }
+
+                            ctx.fillStyle = kr.checked ? CONSTANTS.COLORS.TEXT_MUTED : CONSTANTS.COLORS.TEXT_BODY;
+                            ctx.font = `${CONSTANTS.FONT_SIZE_BODY}px Inter`;
+                            const krText = (kr.displayId ? `${kr.displayId}: ` : '') + kr.label;
+                            if (kr.checked) {
+                                const w = ctx.measureText(krText).width;
+                                ctx.beginPath();
+                                ctx.moveTo(pos.x + 34, centerY);
+                                ctx.lineTo(pos.x + 34 + Math.min(w, node.width - 44), centerY);
+                                ctx.strokeStyle = CONSTANTS.COLORS.TEXT_MUTED;
+                                ctx.stroke();
+                            }
+                            ctx.fillText(krText, pos.x + 34, centerY, node.width - 44);
+                        });
+                    }
+                });
+
+                // 2. Draw Edges
+                parsedGraph.edges.forEach(edge => {
+                    const srcNode = parsedGraph.nodes.find(n => n.id === edge.source);
+                    const tgtNode = parsedGraph.nodes.find(n => n.id === edge.targetNodeId);
+                    if (!srcNode || !tgtNode) return;
+
+                    const srcPos = layoutMap[srcNode.id] || { x: 0, y: 0 };
+                    const tgtPos = layoutMap[tgtNode.id] || { x: 0, y: 0 };
+
+                    const startX = srcPos.x + srcNode.width / 2;
+                    const startY = srcPos.y;
+
+                    let endX, endY;
+                    if (edge.targetType === 'ROW') {
+                        endX = tgtPos.x + tgtNode.width - 4;
+                        endY = tgtPos.y + CONSTANTS.HEADER_HEIGHT + (edge.targetRowIndex * CONSTANTS.ROW_HEIGHT) + (CONSTANTS.ROW_HEIGHT / 2);
+                    } else {
+                        endX = tgtPos.x + tgtNode.width / 2;
+                        endY = tgtPos.y + tgtNode.height;
+                    }
+
+                    ctx.beginPath();
+                    ctx.moveTo(startX, startY);
+
+                    const cp1x = startX;
+                    const cp1y = startY - 80;
+                    const cp2x = edge.targetType === 'ROW' ? endX + 80 : endX;
+                    const cp2y = endY + 80;
+
+                    ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, endX, endY);
+
+                    ctx.strokeStyle = CONSTANTS.COLORS.ALIGN_LINE;
+                    ctx.lineWidth = 2;
+                    ctx.setLineDash([5, 3]);
+                    ctx.stroke();
+                    ctx.setLineDash([]);
+
+                    ctx.fillStyle = CONSTANTS.COLORS.ALIGN_LINE;
+                    ctx.beginPath();
+                    ctx.arc(startX, startY, 3, 0, Math.PI * 2);
+                    ctx.fill();
+
+                    ctx.beginPath();
+                    if (edge.targetType === 'ROW') {
+                        ctx.moveTo(endX, endY);
+                        ctx.lineTo(endX + 8, endY - 5);
+                        ctx.lineTo(endX + 8, endY + 5);
+                    } else {
+                        ctx.moveTo(endX, endY);
+                        ctx.lineTo(endX - 5, endY + 8);
+                        ctx.lineTo(endX + 5, endY + 8);
+                    }
+                    ctx.fill();
+                });
+
+                ctx.restore();
+            }, [parsedGraph, layoutMap, transform]);
+
+            useEffect(() => {
+                let h;
+                const l = () => { draw(); h = requestAnimationFrame(l); };
+                l();
+                return () => cancelAnimationFrame(h);
+            }, [draw]);
+
+            // --- Interaction ---
+            const getWorldPos = (e) => {
+                const rect = canvasRef.current.getBoundingClientRect();
+                return {
+                    x: (e.clientX - rect.left - transform.x) / transform.k,
+                    y: (e.clientY - rect.top - transform.y) / transform.k
+                };
+            };
+
+            const handleMouseDown = (e) => {
+                const pos = getWorldPos(e);
+                lastPosRef.current = { x: e.clientX, y: e.clientY };
+                
+                let hitNode = null, hitCheckbox = null;
+                for (let i = parsedGraph.nodes.length - 1; i >= 0; i--) {
+                    const node = parsedGraph.nodes[i];
+                    const p = layoutMap[node.id] || {x:0,y:0};
+                    if (pos.x >= p.x && pos.x <= p.x + node.width && pos.y >= p.y && pos.y <= p.y + node.height) {
+                        hitNode = node;
+                        if (pos.y > p.y + CONSTANTS.HEADER_HEIGHT) {
+                            const relY = pos.y - (p.y + CONSTANTS.HEADER_HEIGHT);
+                            const idx = Math.floor(relY / CONSTANTS.ROW_HEIGHT);
+                            if (idx >= 0 && idx < node.krs.length) {
+                                if (pos.x >= p.x + 10 && pos.x <= p.x + 30) hitCheckbox = node.krs[idx];
+                            }
+                        }
+                        break;
+                    }
+                }
+
+                if (hitCheckbox) return toggleCheckbox(hitCheckbox.lineIndex);
+                if (hitNode && !e.spaceKey && e.button !== 1) {
+                    isDraggingRef.current = true;
+                    dragTargetRef.current = hitNode.id;
+                } else {
+                    isDraggingRef.current = true;
+                    dragTargetRef.current = 'canvas';
+                }
+            };
+
+            const handleMouseMove = (e) => {
+                if (!isDraggingRef.current) return;
+                const dx = e.clientX - lastPosRef.current.x;
+                const dy = e.clientY - lastPosRef.current.y;
+                lastPosRef.current = {x: e.clientX, y: e.clientY};
+
+                if (dragTargetRef.current === 'canvas') {
+                    setTransform(t => ({...t, x: t.x + dx, y: t.y + dy}));
+                } else {
+                    setLayoutMap(prev => {
+                        const curr = prev[dragTargetRef.current];
+                        if (!curr) return prev;
+                        return { ...prev, [dragTargetRef.current]: { x: curr.x + dx/transform.k, y: curr.y + dy/transform.k } };
+                    });
+                }
+            };
+
+            const handleMouseUp = () => {
+                if (isDraggingRef.current && dragTargetRef.current !== 'canvas') saveWorld(currentWorld, text, layoutMap);
+                isDraggingRef.current = false;
+                dragTargetRef.current = null;
+            };
+
+            const handleWheel = (e) => {
+                e.preventDefault();
+                const scale = Math.min(Math.max(0.1, transform.k * (1 - e.deltaY * 0.001)), 5);
+                const rect = canvasRef.current.getBoundingClientRect();
+                const mx = e.clientX - rect.left, my = e.clientY - rect.top;
+                const nx = mx - (mx - transform.x) * (scale / transform.k);
+                const ny = my - (my - transform.y) * (scale / transform.k);
+                setTransform({ x: nx, y: ny, k: scale });
+            };
+
+            const toggleCheckbox = (idx) => {
+                const lines = text.split('\n');
+                if (lines[idx]) {
+                    lines[idx] = lines[idx].includes('[ ]') ? lines[idx].replace('[ ]','[x]') : lines[idx].replace('[x]','[ ]');
+                    const nt = lines.join('\n');
+                    setText(nt);
+                    saveWorld(currentWorld, nt, layoutMap);
+                }
+            };
+
+            return (
+                <div className="flex flex-col h-full bg-gray-900 text-gray-200">
+                    <div className="h-12 border-b border-gray-700 bg-gray-800 flex items-center px-4 justify-between z-10 shadow-md">
+                        <div className="flex items-center gap-4">
+                            <div className="flex items-center gap-2 text-blue-400 font-bold">
+                                <i data-lucide="layers"></i><span>OKR Canvas</span>
+                            </div>
+                            
+                            {/* World Selector & Creator */}
+                            {!isCreatingWorld ? (
+                                <div className="flex items-center gap-1">
+                                    <select value={currentWorld} onChange={(e) => loadWorld(e.target.value)} className="bg-gray-700 border-gray-600 rounded px-2 py-1 text-sm outline-none focus:border-blue-500 max-w-[150px]">
+                                        {worlds.map(w => <option key={w} value={w}>{w}</option>)}
+                                    </select>
+                                    <button onClick={startCreateWorld} className="p-1 hover:bg-gray-700 rounded text-gray-300" title="Create New World"><i data-lucide="plus" size={16}></i></button>
+                                </div>
+                            ) : (
+                                <div className="flex items-center gap-1 animate-in fade-in slide-in-from-left-2 duration-200">
+                                    <input 
+                                        type="text" 
+                                        value={newWorldName}
+                                        onChange={(e) => setNewWorldName(e.target.value)}
+                                        placeholder="Name..."
+                                        className="bg-gray-700 border border-gray-600 rounded px-2 py-1 text-sm w-24 outline-none focus:border-blue-500"
+                                        autoFocus
+                                    />
+                                    <button onClick={confirmCreateWorld} className="p-1 hover:bg-green-700 bg-green-800 rounded text-white"><i data-lucide="check" size={14}></i></button>
+                                    <button onClick={cancelCreateWorld} className="p-1 hover:bg-red-700 bg-red-800 rounded text-white"><i data-lucide="x" size={14}></i></button>
+                                </div>
+                            )}
+                            
+                            {/* File Actions */}
+                            <div className="flex items-center gap-1 ml-2">
+                                <button onClick={handleExportJson} className="p-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs" title="Export JSON">
+                                    <i data-lucide="download" size={14}></i>
+                                </button>
+                                <button onClick={handleExportPng} className="p-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs" title="Export PNG">
+                                    <i data-lucide="camera" size={14}></i>
+                                </button>
+                                <button onClick={handleImportClick} className="p-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs" title="Import JSON">
+                                    <i data-lucide="upload" size={14}></i>
+                                </button>
+                                <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".json" className="hidden" />
+                            </div>
+
+                            {/* Saved Indicator */}
+                            {lastSaved && (
+                                <span className="text-xs text-gray-500 flex items-center gap-1 ml-2">
+                                    <i data-lucide="check" size={12}></i> {lastSaved}
+                                </span>
+                            )}
+                        </div>
+                        <div className="flex items-center gap-2">
+                             <button onClick={handleShareUrl} className={`px-3 py-1 rounded text-sm flex items-center gap-2 transition-colors ${urlCopied ? 'bg-green-600 text-white' : 'bg-gray-700 hover:bg-gray-600'}`}>
+                                <i data-lucide={urlCopied ? "check" : "share-2"} size={14}></i> {urlCopied ? "Copied!" : "Share URL"}
+                            </button>
+                            <button onClick={() => layoutGraph(true)} className="px-3 py-1 rounded text-sm bg-gray-700 hover:bg-gray-600 flex items-center gap-2">
+                                <i data-lucide="layout-grid" size={14}></i> Auto Layout
+                            </button>
+                            <button onClick={() => setShowEditor(!showEditor)} className={`px-3 py-1 rounded text-sm flex items-center gap-2 ${showEditor ? 'bg-blue-600' : 'bg-gray-700'}`}>
+                                <i data-lucide="file-text" size={14}></i> Editor
+                            </button>
+                        </div>
+                    </div>
+                    <div className="flex-1 flex overflow-hidden relative">
+                        {showEditor && (
+                            <div className="w-96 border-r border-gray-700 flex flex-col bg-gray-900 shadow-xl z-20 absolute left-0 top-0 bottom-0 opacity-95">
+                                <div className="p-3 bg-gray-800 text-xs text-gray-400 border-b border-gray-700 font-mono leading-relaxed">
+                                    # Layer Name (ex: Company)<br/>
+                                    ## ID: Objective<br/>
+                                    - [ ] ID: Key Result<br/>
+                                    &gt; Alignment: ID1, ID2
+                                </div>
+                                <textarea className="flex-1 w-full p-4 bg-gray-900 text-gray-300 outline-none resize-none font-mono text-sm leading-6"
+                                    value={text} onChange={e => { setText(e.target.value); saveWorld(currentWorld, e.target.value, layoutMap); }} spellCheck="false" />
+                            </div>
+                        )}
+                        <div ref={containerRef} className="flex-1 bg-[#111827] relative overflow-hidden canvas-container" style={{marginLeft: showEditor ? '384px' : '0'}}>
+                            <canvas ref={canvasRef} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} onWheel={handleWheel} onContextMenu={e=>e.preventDefault()} className="block touch-none" />
+                        </div>
+                        
+                        {/* Status Overlay */}
+                        <div className="absolute bottom-6 right-6 flex flex-col gap-2 pointer-events-none">
+                             <div className="bg-gray-800/80 backdrop-blur px-3 py-2 rounded text-xs text-gray-400 border border-gray-700 pointer-events-auto">
+                                <div className="font-bold text-gray-300 mb-1">Status:</div>
+                                <div className="flex items-center gap-2">
+                                    <span className="w-2 h-2 rounded-full bg-green-500"></span>
+                                    File Import/Export Enabled
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                </div>
+            );
+        }
+        
+        const root = ReactDOM.createRoot(document.getElementById('root'));
+        root.render(<App />);
+        setTimeout(() => { if (window.lucide) window.lucide.createIcons(); }, 500);
+    </script>
+</body>
+</html>
