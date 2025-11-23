@@ -33,8 +33,9 @@
             NODE_WIDTH: 320,
             HEADER_HEIGHT: 44,
             ROW_HEIGHT: 36,
-            LAYER_HEIGHT: 400,
+            LAYER_HEIGHT: 450, 
             LAYER_LABEL_HEIGHT: 40,
+            DIVISION_MARGIN: 50,
             PADDING: 16,
             FONT_SIZE_TITLE: 15,
             FONT_SIZE_BODY: 13,
@@ -50,26 +51,29 @@
                 CHECKBOX_OFF: '#4b5563',
                 CHECKBOX_ON: '#10b981',
                 LAYER_BG: 'rgba(255, 255, 255, 0.03)',
-                LAYER_TEXT: 'rgba(255, 255, 255, 0.3)'
+                LAYER_TEXT: 'rgba(255, 255, 255, 0.3)',
+                DIVISION_TEXT: 'rgba(255, 255, 255, 0.5)'
             }
         };
 
-        const DEFAULT_TEXT = `# Company Layer (全社目標)
+        const DEFAULT_TEXT = `# Company Layer
 ## O_Comp: Make the World Better
-- [ ] KR_C1: 10M Users
-- [ ] KR_C2: $100M Revenue
+- [ ] KR1: 10M Users
+- [ ] KR2: $100M Revenue
 
-# Product Team Layer (チーム目標)
-## O_Prod: Best UX in the Market
-> Alignment: KR_C1
-- [ ] KR_P1: Release v2.0
-- [ ] KR_P2: NPS > 50
+# Product Team Layer
+## App Division
+### O_App: Best Mobile UX
+- Alignment: O_Comp:KR1
+- [ ] KR1: 5 Star Rating
 
-# Personal Layer (個人目標)
-## O_Me: Lead Frontend Architecture
-> Alignment: KR_P1
-- [x] KR_Me1: Refactor to React
-- [ ] KR_Me2: Write Documentation`;
+## Web Division
+### O_Web: Fastest Loading Site
+- Alignment: O_Comp:KR1
+- [ ] KR1: LCP < 1.0s
+
+# O_Other: Default Layer Objective
+- [ ] KR1: Just works`;
 
         const STORAGE_KEY_PREFIX = "okr_canvas_v3_";
 
@@ -108,6 +112,10 @@
             } catch (e) { console.error("Decoding failed", e); return null; }
         };
 
+        // --- Regex Helpers ---
+        const IS_OBJECTIVE_ID = /^(O[^:]*):/;
+        const IS_KEYRESULT_ID = /^(KR[^:]*):/;
+
         function App() {
             const [worlds, setWorlds] = useState(["Default"]);
             const [currentWorld, setCurrentWorld] = useState("Default");
@@ -130,10 +138,10 @@
             const isDraggingRef = useRef(false);
             const dragTargetRef = useRef(null);
             const lastPosRef = useRef({ x: 0, y: 0 });
+            const hoveredNodeIdRef = useRef(null); // For hover highlight
 
             // --- Persistence Logic ---
             useEffect(() => {
-                // 1. Check URL Parameters first
                 const params = new URLSearchParams(window.location.search);
                 const dataParam = params.get('data');
                 
@@ -147,14 +155,12 @@
                     }
                 }
 
-                // 2. Fallback to LocalStorage (Might fail in sandbox)
                 try {
                     const storedWorlds = JSON.parse(localStorage.getItem(STORAGE_KEY_PREFIX + "worlds") || '["Default"]');
                     setWorlds(storedWorlds);
                     loadWorld("Default");
                 } catch(e) { 
                     console.warn("LocalStorage access failed or empty:", e); 
-                    // Fallback to default in memory
                 }
             }, []);
 
@@ -169,15 +175,12 @@
             };
 
             const saveWorld = (worldName, newText, newLayout) => {
-                // Save to LocalStorage (Best effort)
                 try {
                     localStorage.setItem(STORAGE_KEY_PREFIX + "data_" + worldName, newText);
                     if (newLayout) localStorage.setItem(STORAGE_KEY_PREFIX + "layout_" + worldName, JSON.stringify(newLayout));
-                    
                     const now = new Date();
                     setLastSaved(now.toLocaleTimeString());
                 } catch (e) { console.warn("Save failed (likely sandbox)", e); }
-                
                 setUrlCopied(false);
             };
 
@@ -197,16 +200,12 @@
                 if (name && !worlds.includes(name)) {
                     const newWorlds = [...worlds, name];
                     setWorlds(newWorlds);
-                    try {
-                        localStorage.setItem(STORAGE_KEY_PREFIX + "worlds", JSON.stringify(newWorlds));
-                    } catch(e){}
+                    try { localStorage.setItem(STORAGE_KEY_PREFIX + "worlds", JSON.stringify(newWorlds)); } catch(e){}
                     
-                    // Switch to new world
                     setText(DEFAULT_TEXT);
                     setLayoutMap({});
                     setCurrentWorld(name);
                     saveWorld(name, DEFAULT_TEXT, {});
-                    
                     setIsCreatingWorld(false);
                 } else if (worlds.includes(name)) {
                     alert("That name already exists!");
@@ -216,19 +215,11 @@
             const handleShareUrl = () => {
                 const encoded = encodeState(text, layoutMap);
                 const url = `${window.location.origin}${window.location.pathname}?data=${encoded}`;
-                
-                // Try to update URL bar (Works on GitHub Pages, Fails gracefully in Sandbox)
-                try {
-                    window.history.pushState({}, '', `?data=${encoded}`);
-                } catch (e) {
-                    // Sandbox blocked it, ignore
-                    console.log("URL update skipped (Sandbox)");
-                }
-                
+                try { window.history.pushState({}, '', `?data=${encoded}`); } catch (e) { console.log("URL update skipped (Sandbox)"); }
                 navigator.clipboard.writeText(url).then(() => {
                     setUrlCopied(true);
                     setTimeout(() => setUrlCopied(false), 3000);
-                }).catch(err => alert("Failed to copy URL. Browser restrictions may apply."));
+                }).catch(err => alert("Failed to copy URL."));
             };
 
             // --- File & Image Export/Import ---
@@ -253,7 +244,6 @@
             const handleExportPng = () => {
                 const canvas = canvasRef.current;
                 if (!canvas) return;
-                
                 try {
                     const dataUrl = canvas.toDataURL('image/png');
                     const a = document.createElement('a');
@@ -264,7 +254,7 @@
                     document.body.removeChild(a);
                 } catch (e) {
                     console.error("PNG export failed", e);
-                    alert("Failed to export PNG. (Canvas might be tainted or secure context issue)");
+                    alert("Failed to export PNG.");
                 }
             };
 
@@ -275,126 +265,236 @@
             const handleFileChange = (e) => {
                 const file = e.target.files[0];
                 if (!file) return;
-
                 const reader = new FileReader();
                 reader.onload = (event) => {
                     try {
                         const json = JSON.parse(event.target.result);
                         if (json.text) {
                             const targetName = json.worldName || currentWorld;
-                            
                             if (!worlds.includes(targetName)) {
                                 const newWorlds = [...worlds, targetName];
                                 setWorlds(newWorlds);
                                 try { localStorage.setItem(STORAGE_KEY_PREFIX + "worlds", JSON.stringify(newWorlds)); } catch(e){}
                             }
-
                             setText(json.text);
                             setLayoutMap(json.layout || {});
                             setCurrentWorld(targetName);
                             saveWorld(targetName, json.text, json.layout || {});
                             alert("Loaded successfully!");
-                        } else {
-                            alert("Invalid JSON format");
-                        }
-                    } catch (err) {
-                        alert("Failed to parse JSON");
-                    }
+                        } else { alert("Invalid JSON format"); }
+                    } catch (err) { alert("Failed to parse JSON"); }
                 };
                 reader.readAsText(file);
                 e.target.value = '';
             };
 
 
-            // --- Parsing ---
+            // --- Parsing Logic (Advanced Layer/Division Support) ---
             const parsedGraph = useMemo(() => {
                 const lines = text.split('\n');
-                const layers = [];
+                
+                const layers = []; 
                 const nodes = [];
                 const edges = [];
-                const idToNodeMap = {};
+                const objectiveMap = {}; 
 
-                let currentLayer = null;
+                let currentLayer = null; 
+                let currentDivision = null; 
+                
+                let layerCounter = 0;
+                
+                const getOrCreateLayer = (name) => {
+                    let layer = layers.find(l => l.name === name);
+                    if (!layer) {
+                        layer = { index: layerCounter++, name: name, divisions: [] };
+                        layers.push(layer);
+                        layer.divisions.push({ name: "Default", nodes: [] });
+                    }
+                    return layer;
+                };
+
+                const addToCurrentContext = (node) => {
+                    if (!currentLayer) {
+                        currentLayer = getOrCreateLayer("Default Layer");
+                    }
+                    let div = currentLayer.divisions.find(d => d.name === (currentDivision || "Default"));
+                    if (!div) {
+                        div = { name: currentDivision || "Default", nodes: [] };
+                        currentLayer.divisions.push(div);
+                    }
+                    div.nodes.push(node);
+                    
+                    node.layerIndex = currentLayer.index;
+                    node.divisionName = div.name;
+                    nodes.push(node);
+                };
+
                 let currentObjNode = null;
                 let currentRowIndex = 0;
-                let layerCounter = 0;
 
                 lines.forEach((line, idx) => {
                     const trimmed = line.trim();
                     if (!trimmed) return;
 
+                    // H1: Layer Definition OR Default Layer Objective
                     if (line.startsWith('# ') && !line.startsWith('## ')) {
-                        const layerName = line.replace('# ', '').trim();
-                        currentLayer = { name: layerName, index: layerCounter++ };
-                        layers.push(currentLayer);
-                    }
-                    else if (line.startsWith('## ')) {
-                        if (!currentLayer) {
-                            currentLayer = { name: "Default Layer", index: 0 };
-                            layers.push(currentLayer);
-                            layerCounter = 1;
-                        }
-                        const content = line.replace('## ', '').trim();
-                        const idMatch = content.match(/^([^:]+):/);
-                        const displayId = idMatch ? idMatch[1] : null;
-                        const label = idMatch ? content.substring(idMatch[0].length).trim() : content;
-                        const nodeId = `obj-${idx}`;
+                        const content = line.replace('# ', '').trim();
+                        const isObj = IS_OBJECTIVE_ID.test(content);
 
-                        currentObjNode = {
-                            id: nodeId,
-                            lineIndex: idx,
-                            layerIndex: currentLayer.index,
-                            displayId,
-                            label,
-                            krs: [],
-                            alignments: [],
-                            width: CONSTANTS.NODE_WIDTH,
-                            height: CONSTANTS.HEADER_HEIGHT
-                        };
-                        nodes.push(currentObjNode);
-                        currentRowIndex = 0;
-                        if (displayId) idToNodeMap[displayId] = { nodeId, type: 'NODE' };
+                        if (isObj) {
+                            // H1 Objective -> Default Layer
+                            currentLayer = getOrCreateLayer("Default Layer");
+                            currentDivision = null; 
+                            
+                            const idMatch = content.match(IS_OBJECTIVE_ID);
+                            const displayId = idMatch[1];
+                            const label = content.substring(idMatch[0].length).trim();
+                            
+                            const nodeId = `obj-${idx}`;
+                            currentObjNode = {
+                                id: nodeId, lineIndex: idx, displayId, label,
+                                krs: [], alignments: [],
+                                width: CONSTANTS.NODE_WIDTH, height: CONSTANTS.HEADER_HEIGHT
+                            };
+                            objectiveMap[displayId] = currentObjNode;
+                            addToCurrentContext(currentObjNode);
+                            currentRowIndex = 0;
+
+                        } else {
+                            // H1 Layer -> New Layer
+                            currentLayer = { index: layerCounter++, name: content, divisions: [] };
+                            layers.push(currentLayer);
+                            currentLayer.divisions.push({ name: "Default", nodes: [] });
+                            currentDivision = null;
+                            currentObjNode = null;
+                        }
                     }
+                    // H2: Division Definition OR Layer-Level Objective
+                    else if (line.startsWith('## ') && !line.startsWith('### ')) {
+                        const content = line.replace('## ', '').trim();
+                        const isObj = IS_OBJECTIVE_ID.test(content);
+
+                        if (isObj) {
+                            // H2 Objective -> Layer Level Objective (Reset Division to Default)
+                            if (!currentLayer) currentLayer = getOrCreateLayer("Default Layer");
+                            currentDivision = null; // Explicitly reset division scope for H2 objectives
+
+                            const idMatch = content.match(IS_OBJECTIVE_ID);
+                            const displayId = idMatch[1];
+                            const label = content.substring(idMatch[0].length).trim();
+
+                            const nodeId = `obj-${idx}`;
+                            currentObjNode = {
+                                id: nodeId, lineIndex: idx, displayId, label,
+                                krs: [], alignments: [],
+                                width: CONSTANTS.NODE_WIDTH, height: CONSTANTS.HEADER_HEIGHT
+                            };
+                            objectiveMap[displayId] = currentObjNode;
+                            addToCurrentContext(currentObjNode);
+                            currentRowIndex = 0;
+
+                        } else {
+                            // H2 Division -> New Division in current Layer
+                            if (!currentLayer) currentLayer = getOrCreateLayer("Default Layer");
+                            
+                            currentDivision = content;
+                            if (!currentLayer.divisions.find(d => d.name === content)) {
+                                currentLayer.divisions.push({ name: content, nodes: [] });
+                            }
+                            currentObjNode = null;
+                        }
+                    }
+                    // H3: Division-Level Objective
+                    else if (line.startsWith('### ')) {
+                        const content = line.replace('### ', '').trim();
+                        const isObj = IS_OBJECTIVE_ID.test(content);
+
+                        if (isObj) {
+                            // H3 Objective -> Add to Current Division
+                            if (!currentLayer) currentLayer = getOrCreateLayer("Default Layer");
+                            // Keep currentDivision as is
+
+                            const idMatch = content.match(IS_OBJECTIVE_ID);
+                            const displayId = idMatch[1];
+                            const label = content.substring(idMatch[0].length).trim();
+
+                            const nodeId = `obj-${idx}`;
+                            currentObjNode = {
+                                id: nodeId, lineIndex: idx, displayId, label,
+                                krs: [], alignments: [],
+                                width: CONSTANTS.NODE_WIDTH, height: CONSTANTS.HEADER_HEIGHT
+                            };
+                            objectiveMap[displayId] = currentObjNode;
+                            addToCurrentContext(currentObjNode);
+                            currentRowIndex = 0;
+                        }
+                    }
+                    // List Items
                     else if (trimmed.startsWith('- ')) {
                         if (!currentObjNode) return;
-                        const isChecked = trimmed.includes('[x]');
-                        const content = trimmed.replace(/- \[[x ]\] /, '').trim();
-                        const idMatch = content.match(/^([^:]+):/);
-                        const displayId = idMatch ? idMatch[1] : null;
-                        const label = idMatch ? content.substring(idMatch[0].length).trim() : content;
 
-                        currentObjNode.krs.push({
-                            lineIndex: idx,
-                            displayId,
-                            label,
-                            checked: isChecked,
-                            rowIndex: currentRowIndex
-                        });
-                        if (displayId) idToNodeMap[displayId] = { nodeId: currentObjNode.id, type: 'ROW', rowIndex: currentRowIndex };
-                        currentObjNode.height += CONSTANTS.ROW_HEIGHT;
-                        currentRowIndex++;
-                    }
-                    else if (trimmed.startsWith('> ')) {
-                        if (!currentObjNode) return;
-                        const targetsStr = trimmed.replace(/^> (Alignment:|Aligns to:|Alignment)\s*/i, '').trim();
-                        const targets = targetsStr.split(',').map(s => s.trim());
-                        currentObjNode.alignments.push(...targets);
+                        if (trimmed.match(/^-\s*Alignment\s*:/i)) {
+                            const targetsStr = trimmed.replace(/^-\s*Alignment\s*:\s*/i, '').trim();
+                            const targets = targetsStr.split(',').map(s => s.trim());
+                            currentObjNode.alignments.push(...targets);
+                        }
+                        else if (trimmed.match(/^-\s*\[[ x]\]/)) {
+                            const isChecked = trimmed.includes('[x]');
+                            const content = trimmed.replace(/^-\s*\[[ x]\]\s*/, '').trim();
+                            
+                            const idMatch = content.match(IS_KEYRESULT_ID);
+                            let displayId = null;
+                            let label = content;
+
+                            if (idMatch) {
+                                displayId = idMatch[1];
+                                label = content.substring(idMatch[0].length).trim();
+                            }
+
+                            currentObjNode.krs.push({
+                                lineIndex: idx, displayId, label, checked: isChecked, rowIndex: currentRowIndex
+                            });
+                            currentObjNode.height += CONSTANTS.ROW_HEIGHT;
+                            currentRowIndex++;
+                        }
                     }
                 });
 
+                // Pass 2: Build Edges
                 nodes.forEach(node => {
-                    node.alignments.forEach(targetId => {
-                        const target = idToNodeMap[targetId];
-                        if (target) {
-                            edges.push({
-                                source: node.id,
-                                targetNodeId: target.nodeId,
-                                targetType: target.type,
-                                targetRowIndex: target.rowIndex
-                            });
+                    node.alignments.forEach(targetStr => {
+                        let targetNodeId = null;
+                        let targetType = null;
+                        let targetRowIndex = -1;
+
+                        const colonIndex = targetStr.indexOf(':');
+                        if (colonIndex !== -1) {
+                            const objId = targetStr.substring(0, colonIndex).trim();
+                            const krId = targetStr.substring(colonIndex + 1).trim();
+                            const targetObj = objectiveMap[objId];
+                            if (targetObj) {
+                                const targetKR = targetObj.krs.find(k => k.displayId === krId);
+                                if (targetKR) {
+                                    targetNodeId = targetObj.id;
+                                    targetType = 'ROW';
+                                    targetRowIndex = targetKR.rowIndex;
+                                }
+                            }
+                        } else {
+                            const objId = targetStr.trim();
+                            const targetObj = objectiveMap[objId];
+                            if (targetObj) {
+                                targetNodeId = targetObj.id;
+                                targetType = 'NODE';
+                            }
+                        }
+
+                        if (targetNodeId) {
+                            edges.push({ source: node.id, targetNodeId, targetType, targetRowIndex });
                         }
                     });
                 });
+
                 return { layers, nodes, edges };
             }, [text]);
 
@@ -403,27 +503,33 @@
                 const { nodes, layers } = parsedGraph;
                 const newLayout = { ...layoutMap };
                 const NODE_SPACING = 340;
-
-                const nodesByLayer = {};
-                nodes.forEach(node => {
-                    if (!nodesByLayer[node.layerIndex]) nodesByLayer[node.layerIndex] = [];
-                    nodesByLayer[node.layerIndex].push(node);
-                });
-
+                
                 layers.forEach(layer => {
-                    const layerNodes = nodesByLayer[layer.index] || [];
-                    const totalWidth = layerNodes.length * NODE_SPACING;
-                    const startX = -(totalWidth / 2) + (NODE_SPACING / 2);
+                    const divisionWidths = layer.divisions.map(div => {
+                        if (div.name === "Default" && div.nodes.length === 0) return 0;
+                        return Math.max(1, div.nodes.length) * NODE_SPACING + CONSTANTS.DIVISION_MARGIN;
+                    });
                     
-                    layerNodes.forEach((node, i) => {
-                        const saved = layoutMap[node.id];
-                        if (forceAuto || !saved) {
-                            const x = startX + (i * NODE_SPACING);
-                            const y = (layer.index * CONSTANTS.LAYER_HEIGHT) + 80;
-                            newLayout[node.id] = { x, y };
-                        }
+                    const totalLayerWidth = divisionWidths.reduce((a, b) => a + b, 0);
+                    let startX = -(totalLayerWidth / 2) + (NODE_SPACING / 2);
+
+                    layer.divisions.forEach((div, divIdx) => {
+                        if (div.name === "Default" && div.nodes.length === 0) return;
+
+                        const divWidth = divisionWidths[divIdx];
+                        
+                        div.nodes.forEach((node, i) => {
+                            const saved = layoutMap[node.id];
+                            if (forceAuto || !saved) {
+                                const x = startX + (i * NODE_SPACING);
+                                const y = (layer.index * CONSTANTS.LAYER_HEIGHT) + 100; 
+                                newLayout[node.id] = { x, y };
+                            }
+                        });
+                        startX += divWidth;
                     });
                 });
+
                 setLayoutMap(newLayout);
                 if (forceAuto) saveWorld(currentWorld, text, newLayout);
             }, [parsedGraph, layoutMap, currentWorld, text]);
@@ -453,7 +559,27 @@
                 ctx.translate(transform.x, transform.y);
                 ctx.scale(transform.k, transform.k);
 
-                // 0. Draw Layers
+                // --- Hover Logic Preparation ---
+                const hoveredId = hoveredNodeIdRef.current;
+                const relatedNodeIds = new Set();
+                const relatedEdgeIndices = new Set();
+
+                if (hoveredId) {
+                    relatedNodeIds.add(hoveredId);
+                    // Find related edges/nodes
+                    parsedGraph.edges.forEach((edge, idx) => {
+                        if (edge.source === hoveredId) {
+                            relatedNodeIds.add(edge.targetNodeId);
+                            relatedEdgeIndices.add(idx);
+                        }
+                        if (edge.targetNodeId === hoveredId) {
+                            relatedNodeIds.add(edge.source);
+                            relatedEdgeIndices.add(idx);
+                        }
+                    });
+                }
+
+                // 0. Draw Layers & Divisions
                 const visibleMinX = -transform.x / transform.k;
                 const visibleMaxX = (width - transform.x) / transform.k;
                 const bgX = visibleMinX - 1000;
@@ -461,10 +587,13 @@
 
                 parsedGraph.layers.forEach((layer, i) => {
                     const y = layer.index * CONSTANTS.LAYER_HEIGHT;
+                    
+                    // Layer Background
                     if (i % 2 === 0) {
                         ctx.fillStyle = 'rgba(255, 255, 255, 0.02)';
                         ctx.fillRect(bgX, y, bgW, CONSTANTS.LAYER_HEIGHT);
                     }
+                    
                     ctx.fillStyle = CONSTANTS.COLORS.LAYER_TEXT;
                     ctx.font = 'bold 24px Inter';
                     ctx.textBaseline = 'top';
@@ -478,12 +607,46 @@
                     ctx.setLineDash([10, 10]);
                     ctx.stroke();
                     ctx.setLineDash([]);
+
+                    layer.divisions.forEach(div => {
+                        if (div.nodes.length === 0 || div.name === "Default") return;
+                        
+                        let minX = Infinity, maxX = -Infinity;
+                        div.nodes.forEach(n => {
+                            const p = layoutMap[n.id];
+                            if (p) {
+                                minX = Math.min(minX, p.x);
+                                maxX = Math.max(maxX, p.x + n.width);
+                            }
+                        });
+                        
+                        if (minX !== Infinity) {
+                            const centerX = (minX + maxX) / 2;
+                            ctx.fillStyle = CONSTANTS.COLORS.DIVISION_TEXT;
+                            ctx.font = 'bold 16px Inter';
+                            ctx.textAlign = 'center';
+                            ctx.fillText(div.name, centerX, y + 60);
+                            ctx.textAlign = 'left'; 
+                            
+                            ctx.beginPath();
+                            ctx.moveTo(minX, y + 85);
+                            ctx.lineTo(maxX, y + 85);
+                            ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+                            ctx.lineWidth = 2;
+                            ctx.setLineDash([]);
+                            ctx.stroke();
+                        }
+                    });
                 });
 
                 // 1. Draw Nodes
                 parsedGraph.nodes.forEach(node => {
                     const pos = layoutMap[node.id] || { x: 0, y: 0 };
                     
+                    // Hover Effect
+                    const isDimmed = hoveredId && !relatedNodeIds.has(node.id);
+                    ctx.globalAlpha = isDimmed ? 0.15 : 1.0;
+
                     ctx.shadowColor = 'rgba(0,0,0,0.4)';
                     ctx.shadowBlur = 20;
                     ctx.shadowOffsetY = 8;
@@ -557,10 +720,14 @@
                 });
 
                 // 2. Draw Edges
-                parsedGraph.edges.forEach(edge => {
+                parsedGraph.edges.forEach((edge, idx) => {
                     const srcNode = parsedGraph.nodes.find(n => n.id === edge.source);
                     const tgtNode = parsedGraph.nodes.find(n => n.id === edge.targetNodeId);
                     if (!srcNode || !tgtNode) return;
+
+                    // Hover Effect
+                    const isDimmed = hoveredId && !relatedEdgeIndices.has(idx);
+                    ctx.globalAlpha = isDimmed ? 0.1 : 1.0;
 
                     const srcPos = layoutMap[srcNode.id] || { x: 0, y: 0 };
                     const tgtPos = layoutMap[tgtNode.id] || { x: 0, y: 0 };
@@ -588,7 +755,7 @@
                     ctx.bezierCurveTo(cp1x, cp1y, cp2x, cp2y, endX, endY);
 
                     ctx.strokeStyle = CONSTANTS.COLORS.ALIGN_LINE;
-                    ctx.lineWidth = 2;
+                    ctx.lineWidth = hoveredId && relatedEdgeIndices.has(idx) ? 3 : 2; // Thicker if highlighted
                     ctx.setLineDash([5, 3]);
                     ctx.stroke();
                     ctx.setLineDash([]);
@@ -611,6 +778,7 @@
                     ctx.fill();
                 });
 
+                ctx.globalAlpha = 1.0; // Reset
                 ctx.restore();
             }, [parsedGraph, layoutMap, transform]);
 
@@ -662,7 +830,22 @@
             };
 
             const handleMouseMove = (e) => {
-                if (!isDraggingRef.current) return;
+                if (!isDraggingRef.current) {
+                    // Hover Logic
+                    const pos = getWorldPos(e);
+                    let hitNodeId = null;
+                    for (let i = parsedGraph.nodes.length - 1; i >= 0; i--) {
+                        const node = parsedGraph.nodes[i];
+                        const p = layoutMap[node.id] || {x:0,y:0};
+                        if (pos.x >= p.x && pos.x <= p.x + node.width && pos.y >= p.y && pos.y <= p.y + node.height) {
+                            hitNodeId = node.id;
+                            break;
+                        }
+                    }
+                    hoveredNodeIdRef.current = hitNodeId;
+                    return;
+                }
+
                 const dx = e.clientX - lastPosRef.current.x;
                 const dy = e.clientY - lastPosRef.current.y;
                 lastPosRef.current = {x: e.clientX, y: e.clientY};
@@ -712,7 +895,6 @@
                                 <i data-lucide="layers"></i><span>OKR Canvas</span>
                             </div>
                             
-                            {/* World Selector & Creator */}
                             {!isCreatingWorld ? (
                                 <div className="flex items-center gap-1">
                                     <select value={currentWorld} onChange={(e) => loadWorld(e.target.value)} className="bg-gray-700 border-gray-600 rounded px-2 py-1 text-sm outline-none focus:border-blue-500 max-w-[150px]">
@@ -735,7 +917,6 @@
                                 </div>
                             )}
                             
-                            {/* File Actions */}
                             <div className="flex items-center gap-1 ml-2">
                                 <button onClick={handleExportJson} className="p-1.5 bg-gray-700 hover:bg-gray-600 rounded text-xs" title="Export JSON">
                                     <i data-lucide="download" size={14}></i>
@@ -749,7 +930,6 @@
                                 <input type="file" ref={fileInputRef} onChange={handleFileChange} accept=".json" className="hidden" />
                             </div>
 
-                            {/* Saved Indicator */}
                             {lastSaved && (
                                 <span className="text-xs text-gray-500 flex items-center gap-1 ml-2">
                                     <i data-lucide="check" size={12}></i> {lastSaved}
@@ -772,10 +952,11 @@
                         {showEditor && (
                             <div className="w-96 border-r border-gray-700 flex flex-col bg-gray-900 shadow-xl z-20 absolute left-0 top-0 bottom-0 opacity-95">
                                 <div className="p-3 bg-gray-800 text-xs text-gray-400 border-b border-gray-700 font-mono leading-relaxed">
-                                    # Layer Name (ex: Company)<br/>
-                                    ## ID: Objective<br/>
-                                    - [ ] ID: Key Result<br/>
-                                    &gt; Alignment: ID1, ID2
+                                    # Layer Name<br/>
+                                    ## Division Name<br/>
+                                    ### O1: Objective Title<br/>
+                                    - [ ] KR1: Key Result Title<br/>
+                                    - Alignment: O_Prev:KR_Prev
                                 </div>
                                 <textarea className="flex-1 w-full p-4 bg-gray-900 text-gray-300 outline-none resize-none font-mono text-sm leading-6"
                                     value={text} onChange={e => { setText(e.target.value); saveWorld(currentWorld, e.target.value, layoutMap); }} spellCheck="false" />
@@ -783,17 +964,6 @@
                         )}
                         <div ref={containerRef} className="flex-1 bg-[#111827] relative overflow-hidden canvas-container" style={{marginLeft: showEditor ? '384px' : '0'}}>
                             <canvas ref={canvasRef} onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseUp} onWheel={handleWheel} onContextMenu={e=>e.preventDefault()} className="block touch-none" />
-                        </div>
-                        
-                        {/* Status Overlay */}
-                        <div className="absolute bottom-6 right-6 flex flex-col gap-2 pointer-events-none">
-                             <div className="bg-gray-800/80 backdrop-blur px-3 py-2 rounded text-xs text-gray-400 border border-gray-700 pointer-events-auto">
-                                <div className="font-bold text-gray-300 mb-1">Status:</div>
-                                <div className="flex items-center gap-2">
-                                    <span className="w-2 h-2 rounded-full bg-green-500"></span>
-                                    File Import/Export Enabled
-                                </div>
-                            </div>
                         </div>
                     </div>
                 </div>
